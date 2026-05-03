@@ -3,6 +3,7 @@ import json
 import logging
 import random
 import sys
+from collections import deque
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urljoin
@@ -30,6 +31,8 @@ settings = Settings()
 
 Intent = Literal["hello", "bye", "other"]
 BACKEND_INTENTS: set[Intent] = {"hello", "bye"}
+MESSAGE_CONTEXT_LIMIT = 8
+chat_message_history: dict[int, deque[str]] = {}
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,27 @@ SUPPORT_REPLIES = [
 dp = Dispatcher()
 
 
+def get_previous_messages(chat_id: int) -> list[str]:
+    return list(chat_message_history.get(chat_id, ()))
+
+
+def remember_message(chat_id: int, text: str) -> None:
+    history = chat_message_history.setdefault(
+        chat_id,
+        deque(maxlen=MESSAGE_CONTEXT_LIMIT),
+    )
+    history.append(text)
+
+
+def format_previous_messages(messages: list[str]) -> str:
+    if not messages:
+        return "Истории пока нет."
+
+    return "\n".join(
+        f"{index}. {message}" for index, message in enumerate(messages, start=1)
+    )
+
+
 def parse_message_context(raw_response: str, fallback_text: str) -> MessageContext:
     start = raw_response.find("{")
     end = raw_response.rfind("}")
@@ -71,17 +95,30 @@ def parse_message_context(raw_response: str, fallback_text: str) -> MessageConte
     return MessageContext(intent=intent, analysis=analysis)
 
 
-async def analyze_with_ollama(text: str) -> MessageContext:
+async def analyze_with_ollama(
+    text: str,
+    previous_messages: list[str],
+) -> MessageContext:
     prompt = (
-        "Проанализируй сообщение пользователя и определи его намерение.\n"
-        "Если пользователь хочет поздороваться, передать привет или попросить кого-то передать привет, "
+        "Проанализируй текущее сообщение пользователя и определи его намерение по смыслу всей переписки, "
+        "а не по отдельным ключевым словам.\n"
+        "Пользователи обычно пишут на русском языке. Учитывай разговорные русские формулировки, "
+        "неполные фразы, местоимения и отсылки к предыдущим сообщениям. "
+        "Не требуй точных слов «привет», «здравствуй», «пока» или «до свидания».\n"
+        "Используй предыдущие сообщения только если текущее сообщение неполное или зависит от контекста. "
+        "Например: «ему тоже», «и от меня», «скажи то же самое», «давай завершим», "
+        "«передай то же», «можно от меня так же».\n"
+        "Если по контексту пользователь хочет поздороваться, передать привет или попросить кого-то передать привет, "
         'intent должен быть "hello".\n'
-        "Если пользователь хочет попрощаться, передать прощание или попросить кого-то попрощаться, "
+        "Если по контексту пользователь хочет попрощаться, передать прощание, завершить разговор "
+        "или попросить кого-то попрощаться, "
         'intent должен быть "bye".\n'
-        'Во всех остальных случаях intent должен быть "other".\n'
+        'Если даже с учетом контекста намерение нельзя уверенно понять, intent должен быть "other".\n'
         "Верни только валидный JSON без Markdown и пояснений в формате:\n"
         '{"intent":"hello|bye|other","analysis":"краткая суть сообщения на русском"}\n\n'
-        f"Сообщение: {text}"
+        "Предыдущие сообщения этой переписки от старых к новым:\n"
+        f"{format_previous_messages(previous_messages)}\n\n"
+        f"Текущее сообщение: {text}"
     )
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
@@ -131,8 +168,10 @@ async def message_handler(message: Message) -> None:
         await message.answer("Пожалуйста, отправьте текстовое сообщение.")
         return
 
+    previous_messages = get_previous_messages(message.chat.id)
+
     try:
-        context = await analyze_with_ollama(message.text)
+        context = await analyze_with_ollama(message.text, previous_messages)
         logging.info(
             "Ollama context: intent=%s analysis=%s",
             context.intent,
@@ -148,6 +187,7 @@ async def message_handler(message: Message) -> None:
     except Exception:
         logging.exception("Backend request failed")
 
+    remember_message(message.chat.id, message.text)
     await message.answer(random.choice(SUPPORT_REPLIES))
 
 
