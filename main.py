@@ -1,7 +1,11 @@
 import asyncio
+import json
 import logging
 import random
 import sys
+from dataclasses import dataclass
+from typing import Literal
+from urllib.parse import urljoin
 
 import httpx
 from aiogram import Bot, Dispatcher, html
@@ -19,10 +23,20 @@ class Settings(BaseSettings):
     bot_token: str
     ai_base_url: HttpUrl = HttpUrl("http://localhost:11434")
     ai_model: str = "gemma3:270m"
-    backend_url: HttpUrl = HttpUrl("http://localhost:8000/hello")
+    backend_url: HttpUrl = HttpUrl("http://localhost:8000")
 
 
 settings = Settings()
+
+Intent = Literal["hello", "bye", "other"]
+BACKEND_INTENTS: set[Intent] = {"hello", "bye"}
+
+
+@dataclass(frozen=True)
+class MessageContext:
+    intent: Intent
+    analysis: str
+
 
 SUPPORT_REPLIES = [
     "Ваш запрос принят! Мы уже работаем над этим 💙",
@@ -38,11 +52,36 @@ SUPPORT_REPLIES = [
 dp = Dispatcher()
 
 
-async def analyze_with_ollama(text: str) -> str:
+def parse_message_context(raw_response: str, fallback_text: str) -> MessageContext:
+    start = raw_response.find("{")
+    end = raw_response.rfind("}")
+    if start == -1 or end == -1 or start > end:
+        return MessageContext(intent="other", analysis=fallback_text)
+
+    try:
+        data = json.loads(raw_response[start : end + 1])
+    except json.JSONDecodeError:
+        return MessageContext(intent="other", analysis=fallback_text)
+
+    intent = str(data.get("intent", "other")).strip().lower()
+    if intent not in BACKEND_INTENTS:
+        intent = "other"
+
+    analysis = str(data.get("analysis", "")).strip() or fallback_text
+    return MessageContext(intent=intent, analysis=analysis)
+
+
+async def analyze_with_ollama(text: str) -> MessageContext:
     prompt = (
-        "Проанализируй сообщение пользователя и в одном коротком предложении опиши суть запроса. "
-        "Отвечай только на русском языке, без лишних слов.\n\n"
-        f"Сообщение: {text}\n\nСуть запроса:"
+        "Проанализируй сообщение пользователя и определи его намерение.\n"
+        "Если пользователь хочет поздороваться, передать привет или попросить кого-то передать привет, "
+        'intent должен быть "hello".\n'
+        "Если пользователь хочет попрощаться, передать прощание или попросить кого-то попрощаться, "
+        'intent должен быть "bye".\n'
+        'Во всех остальных случаях intent должен быть "other".\n'
+        "Верни только валидный JSON без Markdown и пояснений в формате:\n"
+        '{"intent":"hello|bye|other","analysis":"краткая суть сообщения на русском"}\n\n'
+        f"Сообщение: {text}"
     )
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
@@ -50,15 +89,33 @@ async def analyze_with_ollama(text: str) -> str:
             json={"model": settings.ai_model, "prompt": prompt, "stream": False},
         )
         response.raise_for_status()
-        return response.json()["response"].strip()
+        return parse_message_context(response.json()["response"].strip(), text)
 
 
-async def send_to_backend(user_message: str, analysis: str) -> None:
+def get_backend_url(intent: Intent) -> str | None:
+    if intent not in BACKEND_INTENTS:
+        return None
+
+    return urljoin(str(settings.backend_url), f"/{intent}")
+
+
+async def send_to_backend(user_message: str, context: MessageContext) -> bool:
+    backend_url = get_backend_url(context.intent)
+    if backend_url is None:
+        logging.info("Backend notification skipped for intent: %s", context.intent)
+        return False
+
     async with httpx.AsyncClient(timeout=10.0) as client:
-        await client.post(
-            str(settings.backend_url),
-            json={"message": user_message, "analysis": analysis},
+        response = await client.post(
+            backend_url,
+            json={
+                "message": user_message,
+                "analysis": context.analysis,
+                "intent": context.intent,
+            },
         )
+        response.raise_for_status()
+        return True
 
 
 @dp.message(CommandStart())
@@ -75,15 +132,19 @@ async def message_handler(message: Message) -> None:
         return
 
     try:
-        analysis = await analyze_with_ollama(message.text)
-        logging.info("Ollama analysis: %s", analysis)
+        context = await analyze_with_ollama(message.text)
+        logging.info(
+            "Ollama context: intent=%s analysis=%s",
+            context.intent,
+            context.analysis,
+        )
     except Exception:
         logging.exception("Ollama request failed")
-        analysis = message.text
+        context = MessageContext(intent="other", analysis=message.text)
 
     try:
-        await send_to_backend(message.text, analysis)
-        logging.info("Backend notified successfully")
+        if await send_to_backend(message.text, context):
+            logging.info("Backend notified successfully")
     except Exception:
         logging.exception("Backend request failed")
 
