@@ -1,0 +1,33 @@
+networks:
+  billa_gorilla_network:
+    driver: bridge
+
+volumes:
+  ollama:
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      ollama:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    networks:
+      - billa_gorilla_network
+    env_file:
+      - .env
+
+  ollama:
+    image: ollama/ollama:0.14.2
+    container_name: ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    networks:
+      - billa_gorilla_network
+    environment:
+      - AI_MODEL
